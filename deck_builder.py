@@ -869,7 +869,7 @@ def summarize_engines_and_loops(
 # Main Run Cycle.
 
 url = "https://api.scryfall.com/cards/collection"
-path = r"C:/temp/loose cards .csv"
+path = r"C:/temp/all cards.csv"
 output_path = r"C:\temp\loose_cards_enriched.csv"
 
 unsortedCards = pd.read_csv(path)
