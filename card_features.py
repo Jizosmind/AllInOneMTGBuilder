@@ -1,149 +1,286 @@
-# card_features.py
+"""
+card_features.py
+
+Lightweight, text-driven feature detectors for Commander deck analysis.
+
+Design goals:
+- Never crash on missing columns / NaNs.
+- Prefer "good enough" heuristics over overfitting.
+- Keep everything DATAFRAME-FRIENDLY (row-in, bool/float out).
+
+If you later migrate to full CardObjects/EventAtoms, these functions should remain
+valid as a fast first-pass layer.
+"""
+
 from __future__ import annotations
-import pandas as pd
 
-from constants import MASS_LAND_DENIAL_NAMES
+import re
+from typing import Any, Iterable
 
-def is_land(row: pd.Series) -> bool:
-    return "Land" in str(row.get("type_line", ""))
 
-def is_ramp(row: pd.Series) -> bool:
-    text = str(row.get("oracle_text", "")).lower()
-    type_line = str(row.get("type_line", "")).lower()
-    cmc = row.get("cmc", 0)
+# -------------------------
+# Small helpers
+# -------------------------
 
-    # Mana rocks / dorks / treasures / land tutors
-    ramp_keywords = [
-        "add {",                      # mana abilities
-        "search your library for a land card",
-        "search your library for up to one basic land",
-        "treasure token",
-        "create a treasure token",
-        "create a treasure artifact token",
-        "gain control of target land until end of turn and untap it",
-    ]
+def _s(v: Any) -> str:
+    """Safe lowercased string."""
+    if v is None:
+        return ""
+    return str(v).lower()
 
-    if "creature" in type_line and "mana" in text:
-        return True
+def _type(row) -> str:
+    return _s(row.get("type_line", ""))
 
-    if cmc <= 4:
-        for kw in ramp_keywords:
-            if kw in text:
-                return True
+def _text(row) -> str:
+    return _s(row.get("oracle_text", ""))
 
-    return False
+def _name(row) -> str:
+    return str(row.get("name", "") or "")
 
-def is_card_draw(row: pd.Series) -> bool:
-    text = str(row.get("oracle_text", "")).lower()
-    # crude but effective: anything that literally says "draw a card"
-    return "draw a card" in text or "draw two cards" in text or "draw three cards" in text
+def _cmc(row) -> float:
+    try:
+        return float(row.get("cmc", 0) or 0)
+    except Exception:
+        return 0.0
 
-def is_board_wipe(row: pd.Series) -> bool:
-    text = str(row.get("oracle_text", "")).lower()
-    # look for "destroy all" / "each creature" style phrases
-    wipe_phrases = [
-        "destroy all creatures",
-        "destroy all nonland permanents",
-        "each creature gets",
-        "all creatures get",
-        "each creature loses",
-        "exile all creatures",
-        "exile all nonland permanents",
-    ]
-    for kw in wipe_phrases:
-        if kw in text:
-            return True
-    return False
 
-def is_removal(row: pd.Series) -> bool:
-    # single-target removal or counterspells
-    text = str(row.get("oracle_text", "")).lower()
-    type_line = str(row.get("type_line", "")).lower()
+# -------------------------
+# Core card type checks
+# -------------------------
 
-    # board wipes are handled separately
+def is_land(row) -> bool:
+    tl = _type(row)
+    # Includes Artifact Land, Basic Land, etc.
+    return "land" in tl
+
+def is_creature(row) -> bool:
+    return "creature" in _type(row)
+
+def is_artifact(row) -> bool:
+    return "artifact" in _type(row)
+
+def is_enchantment(row) -> bool:
+    return "enchantment" in _type(row)
+
+def is_instant_or_sorcery(row) -> bool:
+    tl = _type(row)
+    return ("instant" in tl) or ("sorcery" in tl)
+
+
+# -------------------------
+# Ramp / Draw / Removal / Wipes
+# -------------------------
+
+_RAMP_PATTERNS = [
+    r"\badd\s*\{",                         # "Add {G}"
+    r"\badd\s+\w+\s+mana\b",               # "add one mana"
+    r"\badd\s+\w+\s+mana\s+of\s+any\s+color\b",
+    r"\bsearch your library for (a|two|up to two) land",  # land ramp
+    r"\bput (a|two|up to two) land card[s]? from your (hand|graveyard|library) onto the battlefield\b",
+    r"\btreasure token\b",
+    r"\bcreate (a|two|three|x) treasure\b",
+    r"\buntap (up to )?\w+ lands?\b",
+    r"\breveal.*land card.*put.*onto the battlefield\b",
+]
+
+def is_ramp(row) -> bool:
+    if is_land(row):
+        return False
+    t = _text(row)
+    # avoid false positives like "add a counter" etc.
+    if "add a +1/+1 counter" in t or "add a counter" in t:
+        # still might be mana in text, but this kills the worst FP.
+        pass
+    return any(re.search(p, t) for p in _RAMP_PATTERNS)
+
+_DRAW_PATTERNS = [
+    r"\bdraw (a|two|three|four|x) card",
+    r"\bdraw cards\b",
+    r"\blook at the top \d+ cards? of your library\b",
+    r"\breveal the top \d+ cards? of your library\b",
+    r"\bimpulse draw\b",                   # slang sometimes appears in notes; harmless
+    r"\bexile the top \d+ cards? of your library\b.*\byou may play\b",  # impulse
+    r"\bwhenever you draw\b",              # engines
+    r"\bat the beginning of your upkeep\b.*\bdraw\b",
+    r"\bwhenever .* attacks?\b.*\bdraw\b",
+]
+
+def is_card_draw(row) -> bool:
+    if is_land(row):
+        return False
+    t = _text(row)
+    # Don't count "each opponent draws" as your draw; but if it says "each player draws", it can still be CA parity.
+    # We'll be permissive for now; refine later if needed.
+    return any(re.search(p, t) for p in _DRAW_PATTERNS)
+
+_REMOVAL_PATTERNS = [
+    r"\bdestroy target\b",
+    r"\bexile target\b",
+    r"\breturn target\b.*\bto its owner's hand\b",
+    r"\b(counter|counter target)\b",
+    r"\bfight target\b",
+    r"\bdeals? \d+ damage to target\b",
+    r"\btarget creature gets -\d+/-\d+\b",
+    r"\bsacrifice\b.*\btarget\b",  # edicts
+]
+
+def is_removal(row) -> bool:
+    if is_land(row):
+        return False
+    t = _text(row)
+    # If it's clearly a wipe, don't double-count as single-target removal.
     if is_board_wipe(row):
         return False
+    return any(re.search(p, t) for p in _REMOVAL_PATTERNS)
 
-    removal_keywords = [
-        "destroy target",
-        "exile target",
-        "counter target",
-        "fight target",
-        "deals damage to target creature",
-        "deals damage to any target",
-    ]
-    for kw in removal_keywords:
-        if kw in text:
+_WIPE_PATTERNS = [
+    r"\bdestroy all\b",
+    r"\bexile all\b",
+    r"\breturn all\b.*\bto their owners' hands\b",
+    r"\beach creature\b.*\bdestroy\b",
+    r"\beach nonland permanent\b",
+    r"\ball creatures get -\d+/-\d+\b",
+]
+
+def is_board_wipe(row) -> bool:
+    if is_land(row):
+        return False
+    t = _text(row)
+    return any(re.search(p, t) for p in _WIPE_PATTERNS)
+
+
+# -------------------------
+# High-impact / "game changer" heuristics
+# -------------------------
+
+def is_extra_turn(row) -> bool:
+    t = _text(row)
+    return bool(re.search(r"\btake an extra turn\b", t))
+
+def is_mass_land_denial(row) -> bool:
+    t = _text(row)
+    # Armageddon-style, or heavy stax on lands
+    if re.search(r"\bdestroy all lands\b", t):
+        return True
+    if re.search(r"\beach player sacrifices (all|a) lands?\b", t):
+        return True
+    # Winter Orb / Stasis-like effects
+    if re.search(r"\b(lands?|permanents?) don't untap\b", t) and ("each" in t or "players" in t):
+        return True
+    return False
+
+def is_nonland_tutor(row) -> bool:
+    t = _text(row)
+    # Land tutors are usually ramp; we want "find any card / nonland card"
+    if "search your library" not in t:
+        return False
+    if re.search(r"\bsearch your library for (a|an) land\b", t):
+        return False
+    # Common nonland tutor phrasings
+    return bool(
+        re.search(r"\bsearch your library for (a|an) (card|creature|artifact|enchantment|instant|sorcery|planeswalker)\b", t)
+        or re.search(r"\bsearch your library for a nonland card\b", t)
+    )
+
+def is_game_changer(row) -> bool:
+    """
+    Very coarse 'this spikes the power level' detector.
+    This should be conservative; false positives are annoying.
+    """
+    t = _text(row)
+    # Auto-wins / alt-wins
+    if re.search(r"\byou win the game\b", t) or re.search(r"\bwin the game\b", t):
+        return True
+    # Extra turns
+    if is_extra_turn(row):
+        return True
+    # Mass land denial
+    if is_mass_land_denial(row):
+        return True
+    # Strong tutors (nonland)
+    if is_nonland_tutor(row) and _cmc(row) <= 3.0:
+        return True
+    # "Infinite mana" is not usually spelled out, but "any number" + untap can be a hint. Keep it mild.
+    if "infinite" in t:
+        return True
+    return False
+
+
+# -------------------------
+# Persistent output / engines
+# -------------------------
+
+def has_persistent_output(row) -> bool:
+    """
+    Detect *repeatable* advantage sources:
+    - triggered or activated abilities on permanents that repeatedly make mana/cards/tokens
+    - "at the beginning of", "whenever", "each" patterns
+    """
+    if is_land(row):
+        # Lands can be engines (Cabal Coffers), but treat them separately via persistence_score
+        pass
+
+    tl = _type(row)
+    t = _text(row)
+
+    # Instants/sorceries are not persistent engines by themselves
+    if "instant" in tl or "sorcery" in tl:
+        return False
+
+    # Trigger-based repetition
+    if re.search(r"\bwhenever\b", t) or re.search(r"\bat the beginning of\b", t):
+        if any(x in t for x in ["draw", "create", "add {", "treasure", "token", "return", "exile the top"]):
             return True
 
-    # enchantment-based removal like "enchant creature" that stops it
-    if "aura" in type_line and "enchant creature" in text and (
-        "can't attack" in text or "can't block" in text or "loses all abilities" in text
-    ):
+    # Activated abilities with a repeatable output
+    # e.g., "{T}: Add {G}", "{2}, {T}: Draw a card"
+    if re.search(r"\{t\}:\s*add\s*\{", t):
+        return True
+    if re.search(r"\{t\}:\s*draw\b", t):
+        return True
+    if re.search(r":\s*create\b.*token", t):
+        return True
+
+    # Continuous / replacement engines (Rhystic Study style)
+    if "whenever an opponent" in t and "draw" in t:
         return True
 
     return False
 
-def is_game_changer(row: pd.Series) -> bool:
+def persistence_score(row) -> float:
     """
-    Use Scryfall's built-in game_changer flag instead of a manual name list.
+    Score how 'engine-y' the card is. Used for sorting/reporting.
+    0 = not an engine by our heuristics.
     """
-    val = row.get("game_changer", False)
-    # Sometimes this might be bool, sometimes 0/1, sometimes None
-    return bool(val)
+    t = _text(row)
+    tl = _type(row)
 
-def is_mass_land_denial(row: pd.Series) -> bool:
-    if row.get("name") in MASS_LAND_DENIAL_NAMES:
-        return True
-    text = str(row.get("oracle_text", "")).lower()
-    # very crude pattern-based backup
-    if "destroy all lands" in text:
-        return True
-    if "each land" in text and ("doesn't untap" in text or "becomes" in text):
-        return True
-    return False
+    if not has_persistent_output(row):
+        return 0.0
 
-def is_extra_turn(row: pd.Series) -> bool:
-    text = str(row.get("oracle_text", "")).lower()
-    return "take an extra turn" in text or "extra turn after this one" in text
+    score = 1.0
 
-def is_nonland_tutor(row: pd.Series) -> bool:
-    text = str(row.get("oracle_text", "")).lower()
-    if "search your library" not in text:
-        return False
-    # Ignore pure land tutors (Rampant Growth, Cultivate, etc.)
-    if "for a land card" in text or "for a basic land" in text:
-        return False
-    return True
+    # Bigger if it's hard to remove (enchantment/land)
+    if "enchantment" in tl:
+        score += 0.75
+    if "land" in tl:
+        score += 0.75
+    if "artifact" in tl:
+        score += 0.25
 
-def is_permanent_card(row: pd.Series) -> bool:
-    type_line = str(row.get("type_line", "")).lower()
-    return any(t in type_line for t in ("creature", "artifact", "enchantment", "planeswalker"))
+    # Draw engines > token engines > mana engines (roughly)
+    if "draw" in t:
+        score += 1.25
+    if "create" in t and "token" in t:
+        score += 0.75
+    if "add {" in t or "treasure" in t:
+        score += 0.5
 
-def has_persistent_output(row: pd.Series) -> bool:
-    text = str(row.get("oracle_text", "")).lower()
-    # Crude example rules, tune later:
-    if "create" in text and "token" in text:
-        return True
-    if "emblem" in text:
-        return True
-    # “Until end of turn” usually means non-persistent
-    if "until end of turn" in text:
-        return False
-    # Any static anthem/effect text
-    if "creatures you control" in text or "you control get" in text:
-        return True
-    return False
+    # Trigger quality
+    if "whenever" in t:
+        score += 0.5
+    if "at the beginning of" in t:
+        score += 0.25
 
-def persistence_score(row: pd.Series) -> float:
-    """
-    0 = totally ephemeral (one-shot spell)
-    1 = somewhat persistent (makes tokens / has residual impact)
-    2 = permanent engine (stays and does stuff)
-    """
-    score = 0.0
-    if is_permanent_card(row):
-        score += 1.0
-    if has_persistent_output(row):
-        score += 1.0
-    return score
+    # Soft cap so sorting doesn't go nuts
+    return float(min(score, 5.0))
