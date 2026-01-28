@@ -5,6 +5,8 @@ import numpy as np
 import re
 from enum import Enum, auto
 
+from card_atoms import Atom, AtomPattern
+
 # External constants (provided elsewhere in your project)
 from constants import THEME_KEYWORDS, KEYWORD_THEME_OVERRIDES, KEYWORD_GLOSSARY
 
@@ -23,18 +25,25 @@ class EventKind(Enum):
     SACRIFICE = auto()
     ENTERS = auto()   # ETB / re-enter battlefield
     DIES   = auto()   # dies / goes to GY
+    DESTROY = auto()
+    EXILE = auto()
+    BOUNCE = auto()
+    COUNTER = auto()
+    TUTOR = auto()
+    REANIMATE = auto()
+    STEP = auto()
+    STATE = auto()
 
 
 class Resource(Enum):
+    NONE = auto()
     CARD      = auto()
     TOKEN     = auto()
-    CREATURE  = auto()
     LIFE      = auto()
     MANA      = auto()
     COUNTER   = auto()
     DAMAGE    = auto()
     PERMANENT = auto()
-
 
 class Scope(Enum):
     YOU            = auto()
@@ -42,7 +51,31 @@ class Scope(Enum):
     ANY_PLAYER     = auto()
     YOUR_PERMANENT = auto()
     ANY_PERMANENT  = auto()
+    SELF = auto()
 
+class Source(Enum):
+    ANY = auto()
+    CARD = auto()
+    RULES = auto()
+
+class Step(Enum):
+    UNTAP = auto()
+    UPKEEP = auto()
+    DRAW_STEP = auto()
+    BEGIN_COMBAT = auto()
+    DECLARE_ATTACKERS = auto()
+    DECLARE_BLOCKERS = auto()
+    COMBAT_DAMAGE = auto()
+    END_COMBAT = auto()
+    MAIN1 = auto()
+    MAIN2 = auto()
+    END_STEP = auto()
+    CLEANUP = auto()
+
+class State(Enum):
+    TAPPED = auto()
+    UNTAPPED = auto()
+    PHASED = auto()
 
 # ─────────────────────────────────────────────────────────
 # Low-level action grammar (verb + quantity + object + target)
@@ -82,9 +115,11 @@ class EventTag:
     kind: EventKind
     resource: Resource
     scope: Scope
+    step: Optional[Step] = None
 
     def short(self) -> str:
-        return f"{self.kind.name}:{self.resource.name}:{self.scope.name}"
+        step_str = self.step.name if self.step else "-"
+        return f"{self.kind.name}:{self.resource.name}:{self.scope.name}:{step_str}"
 
 
 @dataclass
@@ -193,6 +228,11 @@ class Effect:
 
     # RESULT
     result_tags:  Set[EventTag] = field(default_factory=set)
+
+    #atoms
+    trigger_atoms: List[AtomPattern] = field(default_factory=set)
+    cost_atoms: List[AtomPattern] = field(default_factory=set) 
+    result_atoms: List[Atom] = field(default_factory=set)
 
     # WHO / WHAT (string helpers)
     actor_tags:   Set[str] = field(default_factory=set)
@@ -643,7 +683,7 @@ def _parse_trigger_tags(trigger_text: str, card_name: Optional[str] = None) -> S
 
     # Upkeep-style hooks (generic recurring trigger)
     if "at the beginning of your upkeep" in tl:
-        tags.add(ev(EventKind.ENTERS, Resource.PERMANENT, Scope.YOU))
+        tags.add(ev(EventKind.STEP, Resource.PERMANENT, Scope.YOU, step=Step.UPKEEP))
 
     # Draw triggers (you drawing)
     if _subject_verb_object(tl, "you", "draw", "card"):
@@ -726,16 +766,21 @@ def _parse_cost_tags(cost_text: str) -> Set[EventTag]:
     tags: Set[EventTag] = set()
     cl = cost_text.lower()
 
-    # Any mana symbols → generic mana cost
-    if "{" in cost_text:
+    symbols = re.findall(r"\{[^}]+\}", cost_text) 
+    mana_symbols = [s.lower() for s in symbols if s.lower() not in ("{t}", "{q}")]
+    
+    if mana_symbols:
         tags.add(ev(EventKind.LOSE, Resource.MANA, Scope.YOU))
+    
+    if ("{T}","{Q}") in cl:
+        tags.add(ev(EventKind.STATE, State.TAPPED ,Scope.SELF))
 
     # Sacrifice as cost
-    if "sacrifice another creature" in cl or "sacrifice a creature" in cl:
-        tags.add(ev(EventKind.SACRIFICE, Resource.CREATURE, Scope.YOUR_PERMANENT))
+    if "sacrifice" in cl:
+        tags.add(ev(EventKind.SACRIFICE, Resource.PERMANENT, Scope.YOUR_PERMANENT))
 
     # Discard as cost
-    if "discard a card" in cl:
+    if "discard" in cl and "card" in cl:
         tags.add(ev(EventKind.LOSE, Resource.CARD, Scope.YOU))
 
     # Pay life as cost
