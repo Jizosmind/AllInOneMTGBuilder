@@ -854,9 +854,6 @@ def _parse_cost_atoms(cost_text: str) -> list[Atom]:
     return atoms
 
 
-# ─────────────────────────────────────────────────────────
-# EventTag parsers (trigger / cost / result)
-# ─────────────────────────────────────────────────────────
 def tags_from_atoms(atoms: list[Atom]) -> set[EventTag]:
     tags: set[EventTag] = set()
 
