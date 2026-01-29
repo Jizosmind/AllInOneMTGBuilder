@@ -547,12 +547,6 @@ def _infer_target_tags(cl: str) -> Set[str]:
     return target_tags
 
 
-def _scope_for_you_default(cl: str) -> Scope:
-    if "under your control" in cl or "you control" in cl or "your " in cl:
-        return Scope.YOUR_PERMANENT
-    return Scope.YOU
-
-
 def _parse_result_atoms(result_text: str, card_name: Optional[str] = None) -> list[Atom]:
     atoms: list[Atom] = []
     cl = (result_text or "").lower()
@@ -860,254 +854,38 @@ def _parse_cost_atoms(cost_text: str) -> list[Atom]:
     return atoms
 
 
-def _parse_result_tags(result_text: str, card_name: Optional[str] = None) -> Set[EventTag]:
-    """
-    Convert a result clause into EventTags.
-
-    This looks at both the raw text and the extracted ActionUnits.
-    """
-    tags: Set[EventTag] = set()
-    cl = result_text.lower()
-    scope_default = _scope_for_you_default(cl)
-    units = extract_action_units(result_text, card_name)
-
-    # 1) ActionUnit-driven mapping
-    for act in units:
-        k = act.kind
-
-        if k == "DRAW_CARD":
-            tags.add(ev(EventKind.DRAW, Resource.CARD, Scope.YOU))
-
-        elif k == "CREATE_TOKEN":
-            tags.add(ev(EventKind.CREATE, Resource.TOKEN, Scope.YOU))
-
-        elif k == "GAIN_LIFE":
-            # If the text clearly says opponents, swap scope
-            if "each opponent gains" in cl or "target opponent gains" in cl:
-                scope = Scope.OPPONENT
-            else:
-                scope = Scope.YOU
-            tags.add(ev(EventKind.GAIN, Resource.LIFE, scope))
-
-        elif k == "LOSE_LIFE":
-            # 'target opponent loses life' / 'each opponent loses life'
-            if "target opponent" in cl or "each opponent" in cl or "opponent loses" in cl:
-                scope = Scope.OPPONENT
-            else:
-                scope = Scope.YOU
-            tags.add(ev(EventKind.LOSE, Resource.LIFE, scope))
-
-        elif k == "DEAL_DAMAGE":
-            # Default: damage to players/planeswalkers
-            scope = Scope.ANY_PLAYER
-            if act.target:
-                if "opponent" in act.target:
-                    scope = Scope.OPPONENT
-            tags.add(ev(EventKind.DEAL, Resource.DAMAGE, scope))
-
-        elif k == "ADD_MANA":
-            tags.add(ev(EventKind.ADD, Resource.MANA, Scope.YOU))
-
-        elif k == "ADD_COUNTER":
-            tags.add(ev(EventKind.ADD, Resource.COUNTER, Scope.YOUR_PERMANENT))
-
-        elif k == "REMOVE_COUNTER":
-            tags.add(ev(EventKind.LOSE, Resource.COUNTER, Scope.YOUR_PERMANENT))
-
-        elif k == "SACRIFICE_CREATURE":
-            tags.add(ev(EventKind.SACRIFICE, Resource.PERMANENT, Scope.YOUR_PERMANENT))
-
-    # 2) Raw-text fallbacks for patterns that ActionUnits don't capture well
-
-    # Tutors / dig: 'put [card(s)] into your hand' → treat as draw-ish
-    if "into your hand" in cl and ("card" in cl or "cards" in cl) and "put" in cl:
-        tags.add(ev(EventKind.DRAW, Resource.CARD, Scope.YOU))
-
-    # Scry = card selection → soft card advantage
-    if "scry" in cl:
-        tags.add(ev(EventKind.DRAW, Resource.CARD, Scope.YOU))
-
-    # Card draw (you)
-    if _subject_verb_object(cl, "you", "draw", "card"):
-        tags.add(ev(EventKind.DRAW, Resource.CARD, Scope.YOU))
-
-    # Lifegain (you)
-    if _subject_verb_object(cl, "you", "gain", "life"):
-        tags.add(ev(EventKind.GAIN, Resource.LIFE, Scope.YOU))
-
-    # Opponent loses life as a result
-    if (
-        _subject_verb_object(cl, "target opponent", "lose", "life")
-        or _subject_verb_object(cl, "each opponent", "lose", "life")
-        or _subject_verb_object(cl, "an opponent", "lose", "life")
-        or _subject_verb_object(cl, "opponent", "lose", "life")
-    ):
-        tags.add(ev(EventKind.LOSE, Resource.LIFE, Scope.OPPONENT))
-
-    # Opponent sacrifices creatures
-    if "each opponent sacrifices a creature" in cl:
-        tags.add(ev(EventKind.SACRIFICE, Resource.PERMANENT, Scope.OPPONENT))
-
-    # Discard as result
-    if "each opponent" in cl and "discards" in cl:
-        tags.add(ev(EventKind.LOSE, Resource.CARD, Scope.OPPONENT))
-    if "target opponent discards" in cl or "target player discards" in cl:
-        tags.add(ev(EventKind.LOSE, Resource.CARD, Scope.ANY_PLAYER))
-
-    # Damage (any target / any player)
-    if (
-        _subject_verb_object(cl, "it", "deal", "damage")
-        or "deals" in cl and "damage" in cl  # keep the coarse fallback
-    ):
-        tags.add(ev(EventKind.DEAL, Resource.DAMAGE, Scope.ANY_PLAYER))
-
-    # Mana production – lands, rocks, etc.
-    if "add" in cl and "mana" in cl:
-        tags.add(ev(EventKind.ADD, Resource.MANA, Scope.YOU))
-    if re.search(r"\badd\s+\{", result_text, flags=re.IGNORECASE):
-        tags.add(ev(EventKind.ADD, Resource.MANA, Scope.YOU))
-
-    # Generic "you may pay {4}" in result clause
-    if re.search(r"you may pay\s+\{", result_text, flags=re.IGNORECASE):
-        tags.add(ev(EventKind.LOSE, Resource.MANA, Scope.YOU))
-
-    # Return to battlefield → ETB-style result
-    if "return" in cl and "to the battlefield" in cl:
-        if "under your control" in cl or "your graveyard" in cl or "you control" in cl:
-            scope = Scope.YOUR_PERMANENT
-        else:
-            scope = Scope.ANY_PERMANENT
-
-        if "creature card" in cl or "creature" in cl:
-            res = Resource.PERMANENT
-        else:
-            res = Resource.PERMANENT
-
-        tags.add(ev(EventKind.ENTERS, res, scope))
-
-    return tags
-
-
 # ─────────────────────────────────────────────────────────
 # EventTag parsers (trigger / cost / result)
 # ─────────────────────────────────────────────────────────
-
-def _parse_trigger_tags(trigger_text: str, card_name: Optional[str] = None) -> Set[EventTag]:
+def tags_from_atoms(atoms: list[Atom]) -> set[EventTag]:
     tags: set[EventTag] = set()
-    tl = trigger_text.lower()
-    units = extract_action_units(trigger_text, card_name)
 
-    # Upkeep-style hooks (generic recurring trigger)
-    if "at the beginning of your upkeep" in tl:
-        tags.add(ev(EventKind.STEP, Resource.PERMANENT, Scope.YOU, step=Step.UPKEEP))
+    for a in atoms:
+        if isinstance(a, ZoneMove):
+            # Draw: library -> hand (YOU)
+            if a.from_zone == Zone.LIBRARY and a.to_zone == Zone.HAND and a.obj == ObjKind.CARD:
+                tags.add(ev(EventKind.DRAW, Resource.CARD, Scope.YOU))
 
-    # Casting triggers (core engine glue)
-    # Covers: "Whenever you cast a spell...", "Whenever an opponent casts...", etc.
-    if " cast " in f" {tl} " and "spell" in tl:
-        if "you cast" in tl:
-            tags.add(ev(EventKind.CAST, Resource.CARD, Scope.YOU))
-        elif "each opponent casts" in tl or "an opponent casts" in tl or "opponent casts" in tl:
-            tags.add(ev(EventKind.CAST, Resource.CARD, Scope.OPPONENT))
-        elif "each player casts" in tl or "a player casts" in tl:
-            tags.add(ev(EventKind.CAST, Resource.CARD, Scope.ANY_PLAYER))
+            # Tokens/permanents entering battlefield under you
+            if a.to_zone == Zone.BATTLEFIELD and a.obj in {ObjKind.TOKEN, ObjKind.PERMANENT}:
+                sc = Scope.YOUR_PERMANENT if (a.controller == "YOU") else Scope.ANY_PERMANENT
+                res = Resource.TOKEN if a.obj == ObjKind.TOKEN else Resource.PERMANENT
+                tags.add(ev(EventKind.ENTERS, res, sc))
 
-    # ActionUnit fallback (if we recognized CAST_SPELL)
-    for act in units:
-        if act.kind == "CAST_SPELL":
-            # Best-effort: infer scope from text
-            if "you cast" in tl:
-                tags.add(ev(EventKind.CAST, Resource.CARD, Scope.YOU))
-            elif "opponent casts" in tl:
-                tags.add(ev(EventKind.CAST, Resource.CARD, Scope.OPPONENT))
-            else:
-                tags.add(ev(EventKind.CAST, Resource.CARD, Scope.ANY_PLAYER))
+            # Dies: battlefield -> graveyard
+            if a.from_zone == Zone.BATTLEFIELD and a.to_zone == Zone.GRAVEYARD and a.obj in {ObjKind.PERMANENT, ObjKind.TOKEN}:
+                sc = Scope.YOUR_PERMANENT if (a.controller == "YOU") else Scope.ANY_PERMANENT
+                tags.add(ev(EventKind.DIES, Resource.PERMANENT, sc))
 
-    # Draw triggers (you drawing)
-    if _subject_verb_object(tl, "you", "draw", "card"):
-        tags.add(ev(EventKind.DRAW, Resource.CARD, Scope.YOU))
-
-    # Lifegain triggers (you gain life)
-    if _subject_verb_object(tl, "you", "gain", "life"):
-        tags.add(ev(EventKind.GAIN, Resource.LIFE, Scope.YOU))
-
-    # Opponent loses life triggers
-    if (
-        _subject_verb_object(tl, "opponent", "lose", "life")
-        or _subject_verb_object(tl, "each opponent", "lose", "life")
-        or _subject_verb_object(tl, "an opponent", "lose", "life")
-        or _subject_verb_object(tl, "target opponent", "lose", "life")
-    ):
-        tags.add(ev(EventKind.LOSE, Resource.LIFE, Scope.OPPONENT))
-
-    # Creature dies patterns...
-    if "creature you control dies" in tl or "another creature you control dies" in tl:
-        tags.add(ev(EventKind.DIES, Resource.PERMANENT, Scope.YOUR_PERMANENT))
-
-    if (
-        "creature an opponent controls dies" in tl
-        or "another creature an opponent controls dies" in tl
-    ):
-        tags.add(ev(EventKind.DIES, Resource.PERMANENT, Scope.OPPONENT))
-
-    if "dies" in tl and "creature" in tl and not any(t.kind == EventKind.DIES for t in tags):
-        tags.add(ev(EventKind.DIES, Resource.PERMANENT, Scope.ANY_PERMANENT))
-
-    if "put into your graveyard from the battlefield" in tl and "creature" in tl:
-        tags.add(ev(EventKind.DIES, Resource.PERMANENT, Scope.YOUR_PERMANENT))
-
-    # ETB variants...
-    if "this creature enters" in tl:
-        tags.add(ev(EventKind.ENTERS, Resource.PERMANENT, Scope.YOUR_PERMANENT))
-
-    if "enters" in tl and "you control" in tl:
-        if "token" in tl:
-            tags.add(ev(EventKind.ENTERS, Resource.TOKEN, Scope.YOUR_PERMANENT))
-        else:
-            tags.add(ev(EventKind.ENTERS, Resource.PERMANENT, Scope.YOUR_PERMANENT))
-
-    if "enters the battlefield under your control" in tl:
-        if "token" in tl:
-            tags.add(ev(EventKind.ENTERS, Resource.TOKEN, Scope.YOUR_PERMANENT))
-        else:
-            tags.add(ev(EventKind.ENTERS, Resource.PERMANENT, Scope.YOUR_PERMANENT))
-    elif "enters the battlefield" in tl:
-        tags.add(ev(EventKind.ENTERS, Resource.PERMANENT, Scope.ANY_PERMANENT))
-
-    return tags
-
-
-def _parse_cost_tags(cost_text: str) -> Set[EventTag]:
-    """
-    Cost clauses usually show up on the left side of ':' in an activated ability.
-    """
-    tags: Set[EventTag] = set()
-    cl = cost_text.lower()
-
-    symbols = re.findall(r"\{[^}]+\}", cost_text) 
-    mana_symbols = [s.lower() for s in symbols if s.lower() not in ("{t}", "{q}")]
-    
-    if mana_symbols:
-        tags.add(ev(EventKind.LOSE, Resource.MANA, Scope.YOU))
-    
-    if "{t}" in cl or "{q}" in cl:
-        # for now: do nothing in tags
-        pass
-
-    # Sacrifice as cost
-    if "sacrifice" in cl:
-        tags.add(ev(EventKind.SACRIFICE, Resource.PERMANENT, Scope.YOUR_PERMANENT))
-
-    # Discard as cost
-    if "discard" in cl and "card" in cl:
-        tags.add(ev(EventKind.LOSE, Resource.CARD, Scope.YOU))
-
-    # Pay life as cost
-    if "pay" in cl and "life" in cl:
-        tags.add(ev(EventKind.LOSE, Resource.LIFE, Scope.YOU))
-
-    # Remove counters as cost
-    if "remove a +1/+1 counter" in cl or "remove a counter" in cl:
-        tags.add(ev(EventKind.LOSE, Resource.COUNTER, Scope.YOUR_PERMANENT))
+        elif isinstance(a, ResourceDelta):
+            if a.resource == "mana":
+                tags.add(ev(EventKind.ADD if a.delta > 0 else EventKind.LOSE, Resource.MANA, Scope.YOU))
+            elif a.resource == "life":
+                tags.add(ev(EventKind.GAIN if a.delta > 0 else EventKind.LOSE, Resource.LIFE, Scope.YOU))
+            elif a.resource == "counter":
+                tags.add(ev(EventKind.ADD if a.delta > 0 else EventKind.LOSE, Resource.COUNTER, Scope.YOUR_PERMANENT))
+            elif a.resource == "damage":
+                tags.add(ev(EventKind.DEAL, Resource.DAMAGE, Scope.ANY_PLAYER))
 
     return tags
 
@@ -1197,8 +975,10 @@ def parse_effects_from_text(
 
         if cost_text:
             cost_atoms = _parse_cost_atoms(cost_text)
+            cost_tags |= tags_from_atoms(cost_atoms)
         if result_text:
             result_atoms = _parse_result_atoms(result_text, card_name)
+            result_tags |= tags_from_atoms(result_atoms)
 
         # Ignore pure reminder / flavor clauses
         if not (trigger_tags or cost_tags or result_tags or trigger_atoms or cost_atoms or result_atoms):
@@ -1305,6 +1085,7 @@ def card_from_row(row: pd.Series) -> Card:
         keywords=keywords,
         effects=effects,
     )
+
 
 def summarize_card_engine(card: Card) -> dict:
     """
