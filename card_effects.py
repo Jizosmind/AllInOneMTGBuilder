@@ -5,17 +5,24 @@ import numpy as np
 import re
 from enum import Enum, auto
 
-from card_atoms import Atom, AtomPattern
+from card_atoms import (
+    Atom,
+    ZoneMove, ResourceDelta, StepChange, StateDelta,
+    tap_atom, untap_atom,
+)
+
+from mtg_vocab import Source, Step, PermanentStatus, Zone, Cause, ObjKind
 
 # External constants (provided elsewhere in your project)
 from constants import THEME_KEYWORDS, KEYWORD_THEME_OVERRIDES, KEYWORD_GLOSSARY
 
 
 # ─────────────────────────────────────────────────────────
-# Event system: small, structured vocabulary
+# Data Modeling Enum, Classes and Helpers
 # ─────────────────────────────────────────────────────────
 
 class EventKind(Enum):
+    CAST = auto()
     DRAW   = auto()   # draw cards
     CREATE = auto()   # create tokens/permanents
     GAIN   = auto()   # gain life, gain resource
@@ -34,7 +41,6 @@ class EventKind(Enum):
     STEP = auto()
     STATE = auto()
 
-
 class Resource(Enum):
     NONE = auto()
     CARD      = auto()
@@ -52,34 +58,6 @@ class Scope(Enum):
     YOUR_PERMANENT = auto()
     ANY_PERMANENT  = auto()
     SELF = auto()
-
-class Source(Enum):
-    ANY = auto()
-    CARD = auto()
-    RULES = auto()
-
-class Step(Enum):
-    UNTAP = auto()
-    UPKEEP = auto()
-    DRAW_STEP = auto()
-    BEGIN_COMBAT = auto()
-    DECLARE_ATTACKERS = auto()
-    DECLARE_BLOCKERS = auto()
-    COMBAT_DAMAGE = auto()
-    END_COMBAT = auto()
-    MAIN1 = auto()
-    MAIN2 = auto()
-    END_STEP = auto()
-    CLEANUP = auto()
-
-class State(Enum):
-    TAPPED = auto()
-    UNTAPPED = auto()
-    PHASED = auto()
-
-# ─────────────────────────────────────────────────────────
-# Low-level action grammar (verb + quantity + object + target)
-# ─────────────────────────────────────────────────────────
 
 @dataclass
 class ActionUnit:
@@ -106,7 +84,6 @@ class ActionUnit:
     kind: Optional[str]
     text_span: str
 
-
 @dataclass(frozen=True)
 class EventTag:
     """
@@ -120,7 +97,6 @@ class EventTag:
     def short(self) -> str:
         step_str = self.step.name if self.step else "-"
         return f"{self.kind.name}:{self.resource.name}:{self.scope.name}:{step_str}"
-
 
 @dataclass
 class KeywordHit:
@@ -142,10 +118,122 @@ class KeywordHit:
         right = " ".join(self.right_words)
         return f"...{left} [{self.keyword}] {right}..."
 
-
 # Convenience helper for EventTags
-def ev(kind: EventKind, res: Resource, scope: Scope) -> EventTag:
-    return EventTag(kind, res, scope)
+def ev(kind: EventKind, res: Resource, scope: Scope, step=None) -> EventTag:
+    return EventTag(kind, res, scope, step=step)
+
+@dataclass
+class Effect:
+    raw_text: str
+    effect_type: str  # "triggered" | "activated" | "static" | "replacement"
+
+    # CONDITION
+    trigger_tags: Set[EventTag] = field(default_factory=set)
+    cost_tags:    Set[EventTag] = field(default_factory=set)
+
+    # RESULT
+    result_tags:  Set[EventTag] = field(default_factory=set)
+
+    #atoms
+    trigger_atoms: List[Atom] = field(default_factory=list)
+    cost_atoms: List[Atom] = field(default_factory=list) 
+    result_atoms: List[Atom] = field(default_factory=list)
+
+    # WHO / WHAT (string helpers)
+    actor_tags:   Set[str] = field(default_factory=set)
+    target_tags:  Set[str] = field(default_factory=set)
+
+    # TIMING (ability-level)
+    timing: Optional[str]  = None
+
+    # Optional helpers
+    condition_description: Optional[str] = None
+    modes: List[dict] = field(default_factory=list)
+
+    # Raw pieces of the parsed clause (debug)
+    trigger_text: Optional[str] = None
+    cost_text:    Optional[str] = None
+    result_text:  Optional[str] = None
+
+    # Parsed micro-structures
+    trigger_actions:  List[ActionUnit] = field(default_factory=list)
+    cost_actions:     List[ActionUnit] = field(default_factory=list)
+    result_actions:   List[ActionUnit] = field(default_factory=list)
+
+    # Keyword + context hits from KEYWORD_GLOSSARY
+    keyword_hits: List[KeywordHit] = field(default_factory=list)
+
+    def infer_theme_tags(self) -> Set[str]:
+        tags: Set[str] = set()
+        text = self.raw_text.lower()
+
+        for theme, patterns in THEME_KEYWORDS.items():
+            if any(pat in text for pat in patterns):
+                tags.add(theme)
+
+        return tags
+
+@dataclass
+class Card:
+    # Basic identity
+    name: str
+    mana_value: float
+    mana_cost: str
+    colors: List[str]
+
+    # Type / permanence
+    types: List[str]
+    subtypes: List[str]
+    is_permanent: bool
+    cast_timing: str  # "instant_speed" | "sorcery_speed" | "special"
+
+    # Scryfall text + keywords
+    oracle_text: str
+    keywords: List[str]
+
+    # Stats
+    power: Optional[int] = None
+    toughness: Optional[int] = None
+    loyalty: Optional[int] = None
+
+    # Parsed effects
+    effects: List[Effect] = field(default_factory=list)
+
+    # Convenience aggregations for synergy / flattening
+    def all_trigger_tags(self) -> Set[EventTag]:
+        return {t for e in self.effects for t in e.trigger_tags}
+
+    def all_result_tags(self) -> Set[EventTag]:
+        return {t for e in self.effects for t in e.result_tags}
+
+    def all_cost_tags(self) -> Set[EventTag]:
+        return {t for e in self.effects for t in e.cost_tags}
+
+    def all_actor_tags(self) -> Set[str]:
+        return {t for e in self.effects for t in e.actor_tags}
+
+    def all_target_tags(self) -> Set[str]:
+        return {t for e in self.effects for t in e.target_tags}
+
+    def infer_theme_tags(self) -> Set[str]:
+        tags: Set[str] = set()
+        text = (self.oracle_text or "").lower()
+
+        for theme, patterns in THEME_KEYWORDS.items():
+            if any(pat in text for pat in patterns):
+                tags.add(theme)
+
+        for kw in self.keywords or []:
+            themes = KEYWORD_THEME_OVERRIDES.get(kw.lower())
+            if themes:
+                tags.update(themes)
+
+        return tags
+
+
+# ─────────────────────────────────────────────────────────
+# Low-level action grammar (verb + quantity + object + target)
+# ─────────────────────────────────────────────────────────
 
 
 # Lexicon for the micro-grammar
@@ -214,120 +302,6 @@ ACTION_LIBRARY: Dict[Tuple[str, str], str] = {
 
 
 # ─────────────────────────────────────────────────────────
-# Card / Effect structures
-# ─────────────────────────────────────────────────────────
-
-@dataclass
-class Effect:
-    raw_text: str
-    effect_type: str  # "triggered" | "activated" | "static" | "replacement"
-
-    # CONDITION
-    trigger_tags: Set[EventTag] = field(default_factory=set)
-    cost_tags:    Set[EventTag] = field(default_factory=set)
-
-    # RESULT
-    result_tags:  Set[EventTag] = field(default_factory=set)
-
-    #atoms
-    trigger_atoms: List[AtomPattern] = field(default_factory=set)
-    cost_atoms: List[AtomPattern] = field(default_factory=set) 
-    result_atoms: List[Atom] = field(default_factory=set)
-
-    # WHO / WHAT (string helpers)
-    actor_tags:   Set[str] = field(default_factory=set)
-    target_tags:  Set[str] = field(default_factory=set)
-
-    # TIMING (ability-level)
-    timing: Optional[str]  = None
-
-    # Optional helpers
-    condition_description: Optional[str] = None
-    modes: List[dict] = field(default_factory=list)
-
-    # Raw pieces of the parsed clause (debug)
-    trigger_text: Optional[str] = None
-    cost_text:    Optional[str] = None
-    result_text:  Optional[str] = None
-
-    # Parsed micro-structures
-    trigger_actions:  List[ActionUnit] = field(default_factory=list)
-    cost_actions:     List[ActionUnit] = field(default_factory=list)
-    result_actions:   List[ActionUnit] = field(default_factory=list)
-
-    # Keyword + context hits from KEYWORD_GLOSSARY
-    keyword_hits: List[KeywordHit] = field(default_factory=list)
-
-    def infer_theme_tags(self) -> Set[str]:
-        tags: Set[str] = set()
-        text = self.raw_text.lower()
-
-        for theme, patterns in THEME_KEYWORDS.items():
-            if any(pat in text for pat in patterns):
-                tags.add(theme)
-
-        return tags
-
-
-@dataclass
-class Card:
-    # Basic identity
-    name: str
-    mana_value: float
-    mana_cost: str
-    colors: List[str]
-
-    # Type / permanence
-    types: List[str]
-    subtypes: List[str]
-    is_permanent: bool
-    cast_timing: str  # "instant_speed" | "sorcery_speed" | "special"
-
-    # Scryfall text + keywords
-    oracle_text: str
-    keywords: List[str]
-
-    # Stats
-    power: Optional[int] = None
-    toughness: Optional[int] = None
-    loyalty: Optional[int] = None
-
-    # Parsed effects
-    effects: List[Effect] = field(default_factory=list)
-
-    # Convenience aggregations for synergy / flattening
-    def all_trigger_tags(self) -> Set[EventTag]:
-        return {t for e in self.effects for t in e.trigger_tags}
-
-    def all_result_tags(self) -> Set[EventTag]:
-        return {t for e in self.effects for t in e.result_tags}
-
-    def all_cost_tags(self) -> Set[EventTag]:
-        return {t for e in self.effects for t in e.cost_tags}
-
-    def all_actor_tags(self) -> Set[str]:
-        return {t for e in self.effects for t in e.actor_tags}
-
-    def all_target_tags(self) -> Set[str]:
-        return {t for e in self.effects for t in e.target_tags}
-
-    def infer_theme_tags(self) -> Set[str]:
-        tags: Set[str] = set()
-        text = (self.oracle_text or "").lower()
-
-        for theme, patterns in THEME_KEYWORDS.items():
-            if any(pat in text for pat in patterns):
-                tags.add(theme)
-
-        for kw in self.keywords or []:
-            themes = KEYWORD_THEME_OVERRIDES.get(kw.lower())
-            if themes:
-                tags.update(themes)
-
-        return tags
-
-
-# ─────────────────────────────────────────────────────────
 # Effect parsing → EventTag sets
 # ─────────────────────────────────────────────────────────
 
@@ -336,7 +310,102 @@ TRIGGER_PREFIX_RE = re.compile(
     re.IGNORECASE,
 )
 
-WORD_TOKEN_RE = re.compile(r"\w+|\S", re.UNICODE)
+
+def _split_abilities(oracle_text: str) -> List[str]:
+    """
+    Split oracle text into ability-like chunks.
+
+    - Newlines as primary separators (Scryfall convention)
+    - For static text blocks, split on '. '
+    """
+    if not oracle_text:
+        return []
+
+    lines = [ln.strip() for ln in oracle_text.split("\n") if ln.strip()]
+    abilities: List[str] = []
+
+    for line in lines:
+        # Activated / triggered → keep whole line
+        if ":" in line or TRIGGER_PREFIX_RE.match(line):
+            abilities.append(line.strip())
+        else:
+            # Static / spell text → split on sentences
+            parts = re.split(r"\.\s+", line)
+            for p in parts:
+                p = p.strip()
+                if p:
+                    abilities.append(p)
+
+    return abilities
+
+
+def _split_trigger_clause(text: str) -> Tuple[Optional[str], str]:
+    """
+    'Whenever another creature you control dies, draw a card.'
+      -> ('Whenever another creature you control dies', 'draw a card.')
+    """
+    m = TRIGGER_PREFIX_RE.match(text)
+    if not m:
+        return None, text
+
+    rest = text[m.end():].strip()
+    if "," in rest:
+        trigger_part, result_part = rest.split(",", 1)
+        trigger_text = f"{m.group(0).strip()} {trigger_part.strip()}"
+        return trigger_text.strip(), result_part.strip()
+    else:
+        # No comma – treat the entire text as a trigger-ish thing
+        return text.strip(), ""
+
+
+def _split_cost_clause(text: str) -> Tuple[Optional[str], str]:
+    """
+    '2W, T, Sacrifice a creature: Draw two cards.'
+      -> ('2W, T, Sacrifice a creature', 'Draw two cards.')
+    """
+    if ":" not in text:
+        return None, text
+    cost_part, result_part = text.split(":", 1)
+    return cost_part.strip(), result_part.strip()
+
+
+def _guess_effect_type(clause: str) -> str:
+    """
+    Classify an ability into triggered / activated / static / replacement.
+    """
+    cl = clause.lower()
+
+    # Replacement effects: "If X would ..., instead ..."
+    if cl.startswith("if ") and " would " in cl and " instead" in cl:
+        return "replacement"
+
+    # Triggered
+    if cl.startswith("whenever ") or cl.startswith("when ") or cl.startswith("at the beginning"):
+        return "triggered"
+
+    # Activated: anything of the form "[cost stuff]: [effect]"
+    if ":" in clause:
+        left = clause.split(":", 1)[0].lower()
+        if (
+            "{" in left
+            or "sacrifice" in left
+            or "discard" in left
+            or "exile" in left
+            or "tap" in left
+            or "untap" in left
+            or "pay" in left
+        ):
+            return "activated"
+
+    return "static"
+
+
+def _simple_tokens(clause: str) -> List[str]:
+    """
+    Very simple whitespace/punctuation tokenizer suited to Oracle text.
+    """
+    clause = clause.replace(",", " , ").replace(":", " : ").replace(".", " . ")
+    return [t for t in clause.split() if t]
 
 
 def _tokenize_with_spans(text: str) -> List[Tuple[str, int, int]]:
@@ -399,62 +468,43 @@ def _extract_keyword_hits(clause: str) -> List[KeywordHit]:
     return hits
 
 
-def _split_abilities(oracle_text: str) -> List[str]:
+WORD_TOKEN_RE = re.compile(r"\w+|\S", re.UNICODE)
+_MTG_SYMBOL_RE = re.compile(r"\{([^}]+)\}")
+
+def _mana_gain_from_add_clause(text: str) -> tuple[int, str] | None:
     """
-    Split oracle text into ability-like chunks.
+    Best-effort mana parsing for results like:
+      - "Add {G}{G}."
+      - "Add {G} or {U}." (choice)
 
-    - Newlines as primary separators (Scryfall convention)
-    - For static text blocks, split on '. '
+    Returns (max_mana_produced, subtype_str) or None if no {..} symbols are present.
     """
-    if not oracle_text:
-        return []
+    if not text:
+        return None
 
-    lines = [ln.strip() for ln in oracle_text.split("\n") if ln.strip()]
-    abilities: List[str] = []
+    lower = text.lower()
+    if "add" not in lower or "{" not in text:
+        return None
 
-    for line in lines:
-        # Activated / triggered → keep whole line
-        if ":" in line or TRIGGER_PREFIX_RE.match(line):
-            abilities.append(line.strip())
-        else:
-            # Static / spell text → split on sentences
-            parts = re.split(r"\.\s+", line)
-            for p in parts:
-                p = p.strip()
-                if p:
-                    abilities.append(p)
+    # Split on " or " to detect choice clauses
+    parts = re.split(r"\s+or\s+", text, flags=re.IGNORECASE)
 
-    return abilities
+    option_amts: list[int] = []
+    option_subs: list[str] = []
 
+    for part in parts:
+        syms = _mana_symbols(part)
+        mana_syms = [s for s in syms if s.upper() not in ("T", "Q")]
+        if not mana_syms:
+            continue
+        option_amts.append(_mana_cost_from_symbols(mana_syms))
+        option_subs.append("".join(mana_syms))
 
-def _split_trigger_clause(text: str) -> Tuple[Optional[str], str]:
-    """
-    'Whenever another creature you control dies, draw a card.'
-      -> ('Whenever another creature you control dies', 'draw a card.')
-    """
-    m = TRIGGER_PREFIX_RE.match(text)
-    if not m:
-        return None, text
+    if not option_amts:
+        return None
 
-    rest = text[m.end():].strip()
-    if "," in rest:
-        trigger_part, result_part = rest.split(",", 1)
-        trigger_text = f"{m.group(0).strip()} {trigger_part.strip()}"
-        return trigger_text.strip(), result_part.strip()
-    else:
-        # No comma – treat the entire text as a trigger-ish thing
-        return text.strip(), ""
-
-
-def _split_cost_clause(text: str) -> Tuple[Optional[str], str]:
-    """
-    '2W, T, Sacrifice a creature: Draw two cards.'
-      -> ('2W, T, Sacrifice a creature', 'Draw two cards.')
-    """
-    if ":" not in text:
-        return None, text
-    cost_part, result_part = text.split(":", 1)
-    return cost_part.strip(), result_part.strip()
+    # Conservative: treat "or" as "choose the best option"
+    return max(option_amts), "|".join(option_subs)
 
 
 def _infer_actor_tags(cl: str) -> Set[str]:
@@ -503,16 +553,74 @@ def _scope_for_you_default(cl: str) -> Scope:
     return Scope.YOU
 
 
+def _parse_result_atoms(result_text: str, card_name: Optional[str] = None) -> list[Atom]:
+    atoms: list[Atom] = []
+    cl = (result_text or "").lower()
+
+    # Mana production: "Add {G}{G}" / "Add {G} or {U}"
+    mg = _mana_gain_from_add_clause(result_text or "")
+    if mg:
+        mana_amt, subtype = mg
+        atoms.append(ResourceDelta(
+            resource="mana",
+            delta=mana_amt,
+            target="YOU",
+            subtype=subtype,
+            cause=Cause.EFFECT,
+            source=Source.CARD
+        ))
+
+    # Use ActionUnits for common results
+    units = extract_action_units(result_text or "", card_name)
+
+    for act in units:
+        if act.kind == "DRAW_CARD":
+            n = act.quantity or 1
+            for _ in range(n):
+                atoms.append(ZoneMove(Zone.LIBRARY, Zone.HAND, ObjKind.CARD, controller="YOU", cause=Cause.EFFECT, source=Source.CARD))
+
+        elif act.kind == "CREATE_TOKEN":
+            n = act.quantity or 1
+            for _ in range(n):
+                atoms.append(ZoneMove(Zone.COMMAND, Zone.BATTLEFIELD, ObjKind.TOKEN, controller="YOU", cause=Cause.EFFECT, source=Source.CARD))
+
+        elif act.kind == "GAIN_LIFE":
+            atoms.append(ResourceDelta(resource="life", delta=act.quantity or 1, target="YOU", cause=Cause.EFFECT, source=Source.CARD))
+
+        elif act.kind == "LOSE_LIFE":
+            tgt = "OPPONENT" if "opponent" in cl else "YOU"
+            atoms.append(ResourceDelta(resource="life", delta=-(act.quantity or 1), target=tgt, cause=Cause.EFFECT, source=Source.CARD))
+
+        elif act.kind == "DEAL_DAMAGE":
+            atoms.append(ResourceDelta(resource="damage", delta=act.quantity or 1, target=act.target or "ANY", cause=Cause.EFFECT, source=Source.CARD))
+
+        elif act.kind == "ADD_COUNTER":
+            subtype = "+1/+1" if "+1/+1" in cl else None
+            atoms.append(ResourceDelta(resource="counter", delta=act.quantity or 1, target="SELF", subtype=subtype, cause=Cause.EFFECT, source=Source.CARD))
+
+        elif act.kind == "REMOVE_COUNTER":
+            subtype = "+1/+1" if "+1/+1" in cl else None
+            atoms.append(ResourceDelta(resource="counter", delta=-(act.quantity or 1), target="SELF", subtype=subtype, cause=Cause.EFFECT, source=Source.CARD))
+        elif act.kind == "ADD_MANA":
+            atoms.append(ResourceDelta(
+                resource="mana",
+                delta=act.quantity or 1,
+                target="YOU",
+                cause=Cause.EFFECT,
+                source=Source.CARD
+            ))
+
+    # Tap/untap as EFFECTS
+    if re.search(r"\buntap\b", cl):
+        atoms.append(untap_atom(target="TARGET", cause=Cause.EFFECT, source=Source.CARD))
+    if re.search(r"\btap\b", cl):
+        atoms.append(tap_atom(target="TARGET", cause=Cause.EFFECT, source=Source.CARD))
+
+    return atoms
+
 # ─────────────────────────────────────────────────────────
 # Micro-grammar: clause → ActionUnit list
 # ─────────────────────────────────────────────────────────
-
-def _simple_tokens(clause: str) -> List[str]:
-    """
-    Very simple whitespace/punctuation tokenizer suited to Oracle text.
-    """
-    clause = clause.replace(",", " , ").replace(":", " : ").replace(".", " . ")
-    return [t for t in clause.split() if t]
 
 
 def extract_action_units(clause: str, card_name: Optional[str] = None) -> List[ActionUnit]:
@@ -529,7 +637,11 @@ def extract_action_units(clause: str, card_name: Optional[str] = None) -> List[A
 
     lc = clause.lower()
     name_l = (card_name or "").lower()
-
+    
+    WORD_TO_INT = {
+        "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6
+    }
+    
     while i < n:
         raw = toks[i]
         tok = raw.lower()
@@ -549,7 +661,10 @@ def extract_action_units(clause: str, card_name: Optional[str] = None) -> List[A
                 quantity = int(qtok)
                 j += 1
             elif qtok in QUANTITY_WORDS:
-                quantity = None if qtok == "x" else 1
+                if qtok == "x":
+                    quantity = None
+                else:
+                    quantity = WORD_TO_INT.get(qtok, 1)
                 j += 1
 
         # 2) Object (damage, card, tokens, life, counter, etc.)
@@ -662,136 +777,87 @@ def _subject_verb_object(
     pattern = rf"\b{subj}\b[^\.]*\b{verb}\w*\b[^\.]*\b{obj}\b"
     return re.search(pattern, t) is not None
 
+#─────────────────────────────────────────────────────────
+#Atom Parsers
+#─────────────────────────────────────────────────────────
+def _mana_symbols(text: str) -> list[str]:
+    return _MTG_SYMBOL_RE.findall(text or "")
 
-# ─────────────────────────────────────────────────────────
-# EventTag parsers (trigger / cost / result)
-# ─────────────────────────────────────────────────────────
 
-def _parse_trigger_tags(trigger_text: str, card_name: Optional[str] = None) -> Set[EventTag]:
-    """
-    Convert a trigger clause into EventTags.
-
-    This combines:
-      - Coarse phrase-based rules for common patterns
-      - ActionUnit-based hints (gain/lose life, ETB, dies)
-    """
-    tags: set[EventTag] = set()
-    tl = trigger_text.lower()
-
-    # Core ActionUnits (mostly for life-gain/loss style triggers)
-    units = extract_action_units(trigger_text, card_name)
-
-    # Upkeep-style hooks (generic recurring trigger)
-    if "at the beginning of your upkeep" in tl:
-        tags.add(ev(EventKind.STEP, Resource.PERMANENT, Scope.YOU, step=Step.UPKEEP))
-
-    # Draw triggers (you drawing)
-    if _subject_verb_object(tl, "you", "draw", "card"):
-        tags.add(ev(EventKind.DRAW, Resource.CARD, Scope.YOU))
-
-    # Lifegain triggers (you gain life)
-    if _subject_verb_object(tl, "you", "gain", "life"):
-        tags.add(ev(EventKind.GAIN, Resource.LIFE, Scope.YOU))
-
-    # Opponent loses life triggers (Exquisite Blood)
-    if (
-        _subject_verb_object(tl, "opponent", "lose", "life")
-        or _subject_verb_object(tl, "each opponent", "lose", "life")
-        or _subject_verb_object(tl, "an opponent", "lose", "life")
-        or _subject_verb_object(tl, "target opponent", "lose", "life")
-    ):
-        tags.add(ev(EventKind.LOSE, Resource.LIFE, Scope.OPPONENT))
-
-    # Creature dies (your stuff)
-    if "creature you control dies" in tl or "another creature you control dies" in tl:
-        tags.add(ev(EventKind.DIES, Resource.CREATURE, Scope.YOUR_PERMANENT))
-
-    # Creature dies (opponent's stuff)
-    if (
-        "creature an opponent controls dies" in tl
-        or "another creature an opponent controls dies" in tl
-    ):
-        tags.add(ev(EventKind.DIES, Resource.CREATURE, Scope.OPPONENT))
-
-    # Generic 'creature dies' fallback
-    if "dies" in tl and "creature" in tl and not any(t.kind == EventKind.DIES for t in tags):
-        tags.add(ev(EventKind.DIES, Resource.CREATURE, Scope.ANY_PERMANENT))
-
-    # "is put into your graveyard from the battlefield" → death shorthand
-    if "put into your graveyard from the battlefield" in tl and "creature" in tl:
-        tags.add(ev(EventKind.DIES, Resource.CREATURE, Scope.YOUR_PERMANENT))
-
-    # ETB variants
-    if "this creature enters" in tl:
-        tags.add(ev(EventKind.ENTERS, Resource.CREATURE, Scope.YOUR_PERMANENT))
-
-    if "enters" in tl and "you control" in tl:
-        if "token" in tl:
-            tags.add(ev(EventKind.ENTERS, Resource.TOKEN, Scope.YOUR_PERMANENT))
-        elif "creature" in tl:
-            tags.add(ev(EventKind.ENTERS, Resource.CREATURE, Scope.YOUR_PERMANENT))
+def _mana_cost_from_symbols(symbols: list[str]) -> int:
+    total = 0
+    for s in symbols:
+        u = s.upper().strip()
+        if u in ("T", "Q"):
+            continue
+        if u.isdigit():
+            total += int(u)
+        elif u in ("X", "Y", "Z"):
+            # Variable costs: treat as 0 for now (or 1 if you prefer)
+            total += 0
         else:
-            tags.add(ev(EventKind.ENTERS, Resource.PERMANENT, Scope.YOUR_PERMANENT))
-
-    if "enters the battlefield under your control" in tl:
-        if "token" in tl:
-            tags.add(ev(EventKind.ENTERS, Resource.TOKEN, Scope.YOUR_PERMANENT))
-        elif "creature" in tl:
-            tags.add(ev(EventKind.ENTERS, Resource.CREATURE, Scope.YOUR_PERMANENT))
-        else:
-            tags.add(ev(EventKind.ENTERS, Resource.PERMANENT, Scope.YOUR_PERMANENT))
-    elif "enters the battlefield" in tl:
-        tags.add(ev(EventKind.ENTERS, Resource.PERMANENT, Scope.ANY_PERMANENT))
-
-    # Cast-from-graveyard trigger (Secrets of the Dead style)
-    if "you cast a spell from your graveyard" in tl:
-        tags.add(ev(EventKind.DRAW, Resource.CARD, Scope.YOU))
-
-    # Use ActionUnits for gain/lose life if we somehow missed them above
-    for act in units:
-        if act.kind == "GAIN_LIFE":
-            tags.add(ev(EventKind.GAIN, Resource.LIFE, Scope.YOU))
-        elif act.kind == "LOSE_LIFE":
-            # Trigger on opponent losing life is the classic Exquisite Blood pattern
-            if act.target and "opponent" in act.target:
-                tags.add(ev(EventKind.LOSE, Resource.LIFE, Scope.OPPONENT))
-
-    return tags
+            # W/U/B/R/G, hybrid, phyrexian, snow, etc.
+            total += 1
+    return total
 
 
-def _parse_cost_tags(cost_text: str) -> Set[EventTag]:
-    """
-    Cost clauses usually show up on the left side of ':' in an activated ability.
-    """
-    tags: Set[EventTag] = set()
-    cl = cost_text.lower()
+def _parse_cost_atoms(cost_text: str) -> list[Atom]:
+    atoms: list[Atom] = []
+    cl = (cost_text or "").lower()
 
-    symbols = re.findall(r"\{[^}]+\}", cost_text) 
-    mana_symbols = [s.lower() for s in symbols if s.lower() not in ("{t}", "{q}")]
-    
-    if mana_symbols:
-        tags.add(ev(EventKind.LOSE, Resource.MANA, Scope.YOU))
-    
-    if ("{T}","{Q}") in cl:
-        tags.add(ev(EventKind.STATE, State.TAPPED ,Scope.SELF))
+    # Tap/untap symbols (state change, NOT mana)
+    if "{t}" in cl:
+        atoms.append(tap_atom(target="SELF", cause=Cause.COST, source=Source.CARD))
+    if "{q}" in cl:
+        atoms.append(untap_atom(target="SELF", cause=Cause.COST, source=Source.CARD))
 
-    # Sacrifice as cost
+    # Mana payment (coarse: count symbols excluding T/Q)
+    syms = _mana_symbols(cost_text)
+    mana_syms = [s for s in syms if s.upper() not in ("T", "Q")]
+    mana_cost = _mana_cost_from_symbols(mana_syms)
+    if mana_cost:
+        atoms.append(ResourceDelta(
+            resource="mana",
+            delta=-mana_cost,
+            target="YOU",
+            cause=Cause.COST,
+            source=Source.CARD
+        ))
+
+    # Sacrifice cost → battlefield to graveyard
     if "sacrifice" in cl:
-        tags.add(ev(EventKind.SACRIFICE, Resource.PERMANENT, Scope.YOUR_PERMANENT))
+        atoms.append(ZoneMove(
+            from_zone=Zone.BATTLEFIELD,
+            to_zone=Zone.GRAVEYARD,
+            obj=ObjKind.PERMANENT,
+            controller="YOU",
+            cause=Cause.SACRIFICE,
+            source=Source.CARD
+        ))
 
-    # Discard as cost
+    # Discard cost
     if "discard" in cl and "card" in cl:
-        tags.add(ev(EventKind.LOSE, Resource.CARD, Scope.YOU))
+        atoms.append(ZoneMove(
+            from_zone=Zone.HAND,
+            to_zone=Zone.GRAVEYARD,
+            obj=ObjKind.CARD,
+            controller="YOU",
+            cause=Cause.COST,
+            source=Source.CARD
+        ))
 
-    # Pay life as cost
+    # Pay life cost (keep coarse)
     if "pay" in cl and "life" in cl:
-        tags.add(ev(EventKind.LOSE, Resource.LIFE, Scope.YOU))
+        m = re.search(r"pay\s+(\d+)\s+life", cl)
+        n = int(m.group(1)) if m else 1
+        atoms.append(ResourceDelta(resource="life", delta=-n, target="YOU", cause=Cause.COST, source=Source.CARD))
 
-    # Remove counters as cost
-    if "remove a +1/+1 counter" in cl or "remove a counter" in cl:
-        tags.add(ev(EventKind.LOSE, Resource.COUNTER, Scope.YOUR_PERMANENT))
+    # Remove counters as cost (coarse)
+    if "remove" in cl and "counter" in cl:
+        subtype = "+1/+1" if "+1/+1" in cl else None
+        atoms.append(ResourceDelta(resource="counter", delta=-1, target="SELF", subtype=subtype, cause=Cause.COST, source=Source.CARD))
 
-    return tags
+    return atoms
 
 
 def _parse_result_tags(result_text: str, card_name: Optional[str] = None) -> Set[EventTag]:
@@ -849,7 +915,7 @@ def _parse_result_tags(result_text: str, card_name: Optional[str] = None) -> Set
             tags.add(ev(EventKind.LOSE, Resource.COUNTER, Scope.YOUR_PERMANENT))
 
         elif k == "SACRIFICE_CREATURE":
-            tags.add(ev(EventKind.SACRIFICE, Resource.CREATURE, Scope.YOUR_PERMANENT))
+            tags.add(ev(EventKind.SACRIFICE, Resource.PERMANENT, Scope.YOUR_PERMANENT))
 
     # 2) Raw-text fallbacks for patterns that ActionUnits don't capture well
 
@@ -880,7 +946,7 @@ def _parse_result_tags(result_text: str, card_name: Optional[str] = None) -> Set
 
     # Opponent sacrifices creatures
     if "each opponent sacrifices a creature" in cl:
-        tags.add(ev(EventKind.SACRIFICE, Resource.CREATURE, Scope.OPPONENT))
+        tags.add(ev(EventKind.SACRIFICE, Resource.PERMANENT, Scope.OPPONENT))
 
     # Discard as result
     if "each opponent" in cl and "discards" in cl:
@@ -913,11 +979,135 @@ def _parse_result_tags(result_text: str, card_name: Optional[str] = None) -> Set
             scope = Scope.ANY_PERMANENT
 
         if "creature card" in cl or "creature" in cl:
-            res = Resource.CREATURE
+            res = Resource.PERMANENT
         else:
             res = Resource.PERMANENT
 
         tags.add(ev(EventKind.ENTERS, res, scope))
+
+    return tags
+
+
+# ─────────────────────────────────────────────────────────
+# EventTag parsers (trigger / cost / result)
+# ─────────────────────────────────────────────────────────
+
+def _parse_trigger_tags(trigger_text: str, card_name: Optional[str] = None) -> Set[EventTag]:
+    tags: set[EventTag] = set()
+    tl = trigger_text.lower()
+    units = extract_action_units(trigger_text, card_name)
+
+    # Upkeep-style hooks (generic recurring trigger)
+    if "at the beginning of your upkeep" in tl:
+        tags.add(ev(EventKind.STEP, Resource.PERMANENT, Scope.YOU, step=Step.UPKEEP))
+
+    # Casting triggers (core engine glue)
+    # Covers: "Whenever you cast a spell...", "Whenever an opponent casts...", etc.
+    if " cast " in f" {tl} " and "spell" in tl:
+        if "you cast" in tl:
+            tags.add(ev(EventKind.CAST, Resource.CARD, Scope.YOU))
+        elif "each opponent casts" in tl or "an opponent casts" in tl or "opponent casts" in tl:
+            tags.add(ev(EventKind.CAST, Resource.CARD, Scope.OPPONENT))
+        elif "each player casts" in tl or "a player casts" in tl:
+            tags.add(ev(EventKind.CAST, Resource.CARD, Scope.ANY_PLAYER))
+
+    # ActionUnit fallback (if we recognized CAST_SPELL)
+    for act in units:
+        if act.kind == "CAST_SPELL":
+            # Best-effort: infer scope from text
+            if "you cast" in tl:
+                tags.add(ev(EventKind.CAST, Resource.CARD, Scope.YOU))
+            elif "opponent casts" in tl:
+                tags.add(ev(EventKind.CAST, Resource.CARD, Scope.OPPONENT))
+            else:
+                tags.add(ev(EventKind.CAST, Resource.CARD, Scope.ANY_PLAYER))
+
+    # Draw triggers (you drawing)
+    if _subject_verb_object(tl, "you", "draw", "card"):
+        tags.add(ev(EventKind.DRAW, Resource.CARD, Scope.YOU))
+
+    # Lifegain triggers (you gain life)
+    if _subject_verb_object(tl, "you", "gain", "life"):
+        tags.add(ev(EventKind.GAIN, Resource.LIFE, Scope.YOU))
+
+    # Opponent loses life triggers
+    if (
+        _subject_verb_object(tl, "opponent", "lose", "life")
+        or _subject_verb_object(tl, "each opponent", "lose", "life")
+        or _subject_verb_object(tl, "an opponent", "lose", "life")
+        or _subject_verb_object(tl, "target opponent", "lose", "life")
+    ):
+        tags.add(ev(EventKind.LOSE, Resource.LIFE, Scope.OPPONENT))
+
+    # Creature dies patterns...
+    if "creature you control dies" in tl or "another creature you control dies" in tl:
+        tags.add(ev(EventKind.DIES, Resource.PERMANENT, Scope.YOUR_PERMANENT))
+
+    if (
+        "creature an opponent controls dies" in tl
+        or "another creature an opponent controls dies" in tl
+    ):
+        tags.add(ev(EventKind.DIES, Resource.PERMANENT, Scope.OPPONENT))
+
+    if "dies" in tl and "creature" in tl and not any(t.kind == EventKind.DIES for t in tags):
+        tags.add(ev(EventKind.DIES, Resource.PERMANENT, Scope.ANY_PERMANENT))
+
+    if "put into your graveyard from the battlefield" in tl and "creature" in tl:
+        tags.add(ev(EventKind.DIES, Resource.PERMANENT, Scope.YOUR_PERMANENT))
+
+    # ETB variants...
+    if "this creature enters" in tl:
+        tags.add(ev(EventKind.ENTERS, Resource.PERMANENT, Scope.YOUR_PERMANENT))
+
+    if "enters" in tl and "you control" in tl:
+        if "token" in tl:
+            tags.add(ev(EventKind.ENTERS, Resource.TOKEN, Scope.YOUR_PERMANENT))
+        else:
+            tags.add(ev(EventKind.ENTERS, Resource.PERMANENT, Scope.YOUR_PERMANENT))
+
+    if "enters the battlefield under your control" in tl:
+        if "token" in tl:
+            tags.add(ev(EventKind.ENTERS, Resource.TOKEN, Scope.YOUR_PERMANENT))
+        else:
+            tags.add(ev(EventKind.ENTERS, Resource.PERMANENT, Scope.YOUR_PERMANENT))
+    elif "enters the battlefield" in tl:
+        tags.add(ev(EventKind.ENTERS, Resource.PERMANENT, Scope.ANY_PERMANENT))
+
+    return tags
+
+
+def _parse_cost_tags(cost_text: str) -> Set[EventTag]:
+    """
+    Cost clauses usually show up on the left side of ':' in an activated ability.
+    """
+    tags: Set[EventTag] = set()
+    cl = cost_text.lower()
+
+    symbols = re.findall(r"\{[^}]+\}", cost_text) 
+    mana_symbols = [s.lower() for s in symbols if s.lower() not in ("{t}", "{q}")]
+    
+    if mana_symbols:
+        tags.add(ev(EventKind.LOSE, Resource.MANA, Scope.YOU))
+    
+    if "{t}" in cl or "{q}" in cl:
+        # for now: do nothing in tags
+        pass
+
+    # Sacrifice as cost
+    if "sacrifice" in cl:
+        tags.add(ev(EventKind.SACRIFICE, Resource.PERMANENT, Scope.YOUR_PERMANENT))
+
+    # Discard as cost
+    if "discard" in cl and "card" in cl:
+        tags.add(ev(EventKind.LOSE, Resource.CARD, Scope.YOU))
+
+    # Pay life as cost
+    if "pay" in cl and "life" in cl:
+        tags.add(ev(EventKind.LOSE, Resource.LIFE, Scope.YOU))
+
+    # Remove counters as cost
+    if "remove a +1/+1 counter" in cl or "remove a counter" in cl:
+        tags.add(ev(EventKind.LOSE, Resource.COUNTER, Scope.YOUR_PERMANENT))
 
     return tags
 
@@ -1001,8 +1191,17 @@ def parse_effects_from_text(
         if effect_type == "activated":
             actor_tags.add("YOU")
 
+        trigger_atoms: list[Atom] = []
+        cost_atoms: list[Atom] = []
+        result_atoms: list[Atom] = []
+
+        if cost_text:
+            cost_atoms = _parse_cost_atoms(cost_text)
+        if result_text:
+            result_atoms = _parse_result_atoms(result_text, card_name)
+
         # Ignore pure reminder / flavor clauses
-        if not (trigger_tags or cost_tags or result_tags):
+        if not (trigger_tags or cost_tags or result_tags or trigger_atoms or cost_atoms or result_atoms):
             continue
 
         effects.append(
@@ -1012,6 +1211,11 @@ def parse_effects_from_text(
                 trigger_tags=trigger_tags,
                 cost_tags=cost_tags,
                 result_tags=result_tags,
+
+                trigger_atoms=trigger_atoms,
+                cost_atoms=cost_atoms,
+                result_atoms=result_atoms,
+
                 actor_tags=actor_tags,
                 target_tags=target_tags,
                 timing=None,
@@ -1102,38 +1306,6 @@ def card_from_row(row: pd.Series) -> Card:
         effects=effects,
     )
 
-
-def _guess_effect_type(clause: str) -> str:
-    """
-    Classify an ability into triggered / activated / static / replacement.
-    """
-    cl = clause.lower()
-
-    # Replacement effects: "If X would ..., instead ..."
-    if cl.startswith("if ") and " would " in cl and " instead" in cl:
-        return "replacement"
-
-    # Triggered
-    if cl.startswith("whenever ") or cl.startswith("when ") or cl.startswith("at the beginning"):
-        return "triggered"
-
-    # Activated: anything of the form "[cost stuff]: [effect]"
-    if ":" in clause:
-        left = clause.split(":", 1)[0].lower()
-        if (
-            "{" in left
-            or "sacrifice" in left
-            or "discard" in left
-            or "exile" in left
-            or "tap" in left
-            or "untap" in left
-            or "pay" in left
-        ):
-            return "activated"
-
-    return "static"
-
-
 def summarize_card_engine(card: Card) -> dict:
     """
     Flatten a Card's engine-relevant info into a simple dict, suitable for
@@ -1178,7 +1350,7 @@ def engine_score(card: Card) -> float:
                 score += 1.0
 
         # Costs that hurt engines
-        if any(c.kind == EventKind.SACRIFICE and c.resource == Resource.CREATURE for c in e.cost_tags):
+        if any(c.kind == EventKind.SACRIFICE and c.resource == Resource.PERMANENT for c in e.cost_tags):
             score -= 1.0
         if any(c.kind == EventKind.LOSE and c.resource == Resource.LIFE for c in e.cost_tags):
             score -= 0.5
@@ -1226,37 +1398,29 @@ def card_synergy(a: Card, b: Card) -> float:
     # ─────────────────────────────────────────────────────────
 
     def effect_produces_mana(e: Effect) -> bool:
-        return any(
-            t.kind == EventKind.ADD
-            and t.resource == Resource.MANA
-            and t.scope == Scope.YOU
-            for t in e.result_tags
-        )
+        return any(isinstance(a, ResourceDelta) and a.resource == "mana" and a.delta > 0 for a in e.result_atoms)
 
     def effect_consumes_mana(e: Effect) -> bool:
-        # IMPORTANT: only costs, never results
-        return any(
-            t.kind == EventKind.LOSE
-            and t.resource == Resource.MANA
-            and t.scope == Scope.YOU
-            for t in e.cost_tags
-        )
+        return any(isinstance(a, ResourceDelta) and a.resource == "mana" and a.delta < 0 for a in e.cost_atoms)
 
     def effect_produces_bodies(e: Effect) -> bool:
         return any(
-            t.kind == EventKind.CREATE
-            and t.resource in {Resource.TOKEN, Resource.CREATURE}
-            and t.scope == Scope.YOU
-            for t in e.result_tags
+            isinstance(a, ZoneMove)
+            and a.to_zone == Zone.BATTLEFIELD
+            and a.obj in {ObjKind.TOKEN, ObjKind.PERMANENT}
+            and a.controller == "YOU"
+            for a in e.result_atoms
         )
 
     def effect_sacs_creatures(e: Effect) -> bool:
-        # Again: only costs, because that's the entire point of the separation
         return any(
-            t.kind == EventKind.SACRIFICE
-            and t.resource == Resource.CREATURE
-            and t.scope == Scope.YOUR_PERMANENT
-            for t in e.cost_tags
+            isinstance(a, ZoneMove)
+            and a.from_zone == Zone.BATTLEFIELD
+            and a.to_zone == Zone.GRAVEYARD
+            and a.obj == ObjKind.PERMANENT
+            and a.controller == "YOU"
+            and a.cause == Cause.SACRIFICE
+            for a in e.cost_atoms
         )
 
     # Per-effect synergy passes
@@ -1310,7 +1474,7 @@ def card_synergy(a: Card, b: Card) -> float:
     #    Two cards that both demand the same scarce thing hurt each other a bit.
     # ─────────────────────────────────────────────────────────
     bad_cost_pairs = {
-        (EventKind.SACRIFICE, Resource.CREATURE),
+        (EventKind.SACRIFICE, Resource.PERMANENT),
         (EventKind.LOSE,      Resource.LIFE),
     }
 
