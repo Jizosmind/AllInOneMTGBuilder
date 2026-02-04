@@ -50,7 +50,6 @@ class ZoneMove:
     to_zone: Zone
     obj: ObjKind
     obj_types: FrozenSet[str] = frozenset()
-
     controller: Optional[str] = None
     cause: Cause = Cause.OTHER
     source: Source = Source.ANY
