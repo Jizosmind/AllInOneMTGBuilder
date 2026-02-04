@@ -483,7 +483,7 @@ def _mana_gain_from_add_clause(text: str) -> tuple[int, str] | None:
         return None
 
     lower = text.lower()
-    if "add" not in lower or "{" not in text:
+    if " add " not in lower or "{" not in text:
         return None
 
     # Split on " or " to detect choice clauses
@@ -494,7 +494,7 @@ def _mana_gain_from_add_clause(text: str) -> tuple[int, str] | None:
 
     for part in parts:
         syms = _mana_symbols(part)
-        mana_syms = [s for s in syms if s.upper() not in ("T", "Q")]
+        mana_syms = [s for s in syms if s.upper() not in ("T", "Q", "E")]
         if not mana_syms:
             continue
         option_amts.append(_mana_cost_from_symbols(mana_syms))
@@ -807,7 +807,7 @@ def _parse_cost_atoms(cost_text: str) -> list[Atom]:
 
     # Mana payment (coarse: count symbols excluding T/Q)
     syms = _mana_symbols(cost_text)
-    mana_syms = [s for s in syms if s.upper() not in ("T", "Q")]
+    mana_syms = [s for s in syms if s.upper() not in ("T", "Q", "E")]
     mana_cost = _mana_cost_from_symbols(mana_syms)
     if mana_cost:
         atoms.append(ResourceDelta(
@@ -853,6 +853,64 @@ def _parse_cost_atoms(cost_text: str) -> list[Atom]:
 
     return atoms
 
+
+def _parse_trigger_atoms(cost_text: str) -> list[Atom]:
+    atoms: list[Atom] = []
+    cl = (cost_text or "").lower()
+
+    # Tap/untap symbols (state change, NOT mana)
+    if "{t}" in cl:
+        atoms.append(tap_atom(target="SELF", cause=Cause.COST, source=Source.CARD))
+    if "{q}" in cl:
+        atoms.append(untap_atom(target="SELF", cause=Cause.COST, source=Source.CARD))
+
+    # Mana payment (coarse: count symbols excluding T/Q)
+    syms = _mana_symbols(cost_text)
+    mana_syms = [s for s in syms if s.upper() not in ("T", "Q", "E")]
+    mana_cost = _mana_cost_from_symbols(mana_syms)
+    if mana_cost:
+        atoms.append(ResourceDelta(
+            resource="mana",
+            delta=-mana_cost,
+            target="YOU",
+            cause=Cause.COST,
+            source=Source.CARD
+        ))
+
+    # Sacrifice cost → battlefield to graveyard
+    if "sacrifice" in cl:
+        atoms.append(ZoneMove(
+            from_zone=Zone.BATTLEFIELD,
+            to_zone=Zone.GRAVEYARD,
+            obj=ObjKind.PERMANENT,
+            controller="YOU",
+            cause=Cause.SACRIFICE,
+            source=Source.CARD
+        ))
+
+    # Discard cost
+    if "discard" in cl and "card" in cl:
+        atoms.append(ZoneMove(
+            from_zone=Zone.HAND,
+            to_zone=Zone.GRAVEYARD,
+            obj=ObjKind.CARD,
+            controller="YOU",
+            cause=Cause.COST,
+            source=Source.CARD
+        ))
+
+    # Pay life cost (keep coarse)
+    if "pay" in cl and "life" in cl:
+        m = re.search(r"pay\s+(\d+)\s+life", cl)
+        n = int(m.group(1)) if m else 1
+        atoms.append(ResourceDelta(resource="life", delta=-n, target="YOU", cause=Cause.COST, source=Source.CARD))
+
+    # Remove counters as cost (coarse)
+    if "remove" in cl and "counter" in cl:
+        subtype = "+1/+1" if "+1/+1" in cl else None
+        atoms.append(ResourceDelta(resource="counter", delta=-1, target="SELF", subtype=subtype, cause=Cause.COST, source=Source.CARD))
+
+    return atoms
 
 def tags_from_atoms(atoms: list[Atom]) -> set[EventTag]:
     tags: set[EventTag] = set()
@@ -928,6 +986,10 @@ def parse_effects_from_text(
         cost_tags:    Set[EventTag] = set()
         result_tags:  Set[EventTag] = set()
 
+        trigger_atoms: list[Atom] = []
+        cost_atoms: list[Atom] = []
+        result_atoms: list[Atom] = []
+
         trigger_actions: List[ActionUnit] = []
         cost_actions:    List[ActionUnit] = []
         result_actions:  List[ActionUnit] = []
@@ -940,23 +1002,28 @@ def parse_effects_from_text(
             trigger_text, result_text = _split_trigger_clause(clause)
             if trigger_text:
                 trigger_actions = extract_action_units(trigger_text, card_name)
-                trigger_tags |= _parse_trigger_tags(trigger_text, card_name)
+                trigger_atoms = _parse_trigger_atoms(trigger_text)
+                trigger_tags |= tags_from_atoms(trigger_atoms)
             if result_text:
                 result_actions = extract_action_units(result_text, card_name)
-                result_tags |= _parse_result_tags(result_text, card_name)
+                result_atoms = _parse_result_atoms(result_text)
+                result_tags |= tags_from_atoms(result_atoms)
 
         elif effect_type == "activated":
             cost_text, result_text = _split_cost_clause(clause)
             if cost_text:
                 cost_actions = extract_action_units(cost_text, card_name)
-                cost_tags |= _parse_cost_tags(cost_text)
+                cost_atoms = _parse_cost_atoms(cost_text)
+                cost_tags |= tags_from_atoms(cost_atoms)
             if result_text:
                 result_actions = extract_action_units(result_text, card_name)
-                result_tags |= _parse_result_tags(result_text, card_name)
+                result_atoms = _parse_result_atoms(result_text)
+                result_tags |= tags_from_atoms(result_atoms)
 
         else:  # static / spell text
             result_actions = extract_action_units(result_text, card_name)
-            result_tags |= _parse_result_tags(result_text, card_name)
+            result_atoms = _parse_result_atoms(result_text)
+            result_tags |= tags_from_atoms(result_atoms)
 
         # --- actors / targets ---
         actor_tags  = _infer_actor_tags(cl)
@@ -965,17 +1032,6 @@ def parse_effects_from_text(
         # Activated abilities are controlled by you by default
         if effect_type == "activated":
             actor_tags.add("YOU")
-
-        trigger_atoms: list[Atom] = []
-        cost_atoms: list[Atom] = []
-        result_atoms: list[Atom] = []
-
-        if cost_text:
-            cost_atoms = _parse_cost_atoms(cost_text)
-            cost_tags |= tags_from_atoms(cost_atoms)
-        if result_text:
-            result_atoms = _parse_result_atoms(result_text, card_name)
-            result_tags |= tags_from_atoms(result_atoms)
 
         # Ignore pure reminder / flavor clauses
         if not (trigger_tags or cost_tags or result_tags or trigger_atoms or cost_atoms or result_atoms):
@@ -1305,6 +1361,177 @@ def build_engine_table(df: pd.DataFrame) -> pd.DataFrame:
     return eng_df
 
 
+def _fmt_atom(a: Atom) -> str:
+    """
+    Compact, readable atom printout for debugging.
+    Falls back to repr() if an unknown Atom type shows up.
+    """
+    try:
+        if isinstance(a, ZoneMove):
+            return (
+                f"ZoneMove {a.obj.name} {a.from_zone.name}->{a.to_zone.name} "
+                f"ctrl={getattr(a, 'controller', None)} cause={getattr(a, 'cause', None)} src={getattr(a, 'source', None)}"
+            )
+
+        if isinstance(a, ResourceDelta):
+            return (
+                f"ResourceDelta {a.resource} {a.delta:+} "
+                f"tgt={getattr(a, 'target', None)} subtype={getattr(a, 'subtype', None)} "
+                f"cause={getattr(a, 'cause', None)} src={getattr(a, 'source', None)}"
+            )
+
+        if isinstance(a, StepChange):
+            return (
+                f"StepChange step={getattr(a, 'step', None)} "
+                f"cause={getattr(a, 'cause', None)} src={getattr(a, 'source', None)}"
+            )
+
+        if isinstance(a, StateDelta):
+            # You may have different field names here; this prints whatever exists.
+            bits = []
+            for key in ["status", "delta", "target", "subtype", "state"]:
+                if hasattr(a, key):
+                    bits.append(f"{key}={getattr(a, key)}")
+            return f"StateDelta " + " ".join(bits)
+
+        return repr(a)
+
+    except Exception:
+        return repr(a)
+
+
+def _atoms_for_clause(clause: str, card_name: str | None = None):
+    """
+    Debug extractor: classify clause, split it, and produce atoms.
+    Does NOT use tags or ActionUnits output; atoms only.
+    """
+    effect_type = _guess_effect_type(clause)
+
+    trigger_text = None
+    cost_text = None
+    result_text = clause
+
+    trigger_atoms: list[Atom] = []
+    cost_atoms: list[Atom] = []
+    result_atoms: list[Atom] = []
+
+    if effect_type == "triggered":
+        trigger_text, result_text = _split_trigger_clause(clause)
+
+        if trigger_text:
+            # Your local signature might be _parse_trigger_atoms(text) or _parse_trigger_atoms(text, card_name)
+            try:
+                trigger_atoms = _parse_trigger_atoms(trigger_text, card_name)
+            except TypeError:
+                trigger_atoms = _parse_trigger_atoms(trigger_text)
+
+        if result_text:
+            result_atoms = _parse_result_atoms(result_text, card_name)
+
+    elif effect_type == "activated":
+        cost_text, result_text = _split_cost_clause(clause)
+
+        if cost_text:
+            cost_atoms = _parse_cost_atoms(cost_text)
+
+        if result_text:
+            result_atoms = _parse_result_atoms(result_text, card_name)
+
+    else:
+        # static / spell text
+        result_atoms = _parse_result_atoms(result_text, card_name)
+
+    return effect_type, trigger_text, cost_text, result_text, trigger_atoms, cost_atoms, result_atoms
+
+
+def test_random_cards_atoms(num_samples: int = 20, seed: int = 42) -> None:
+    """
+    Pull a random subset of cards and print ONLY atoms per clause:
+      - trigger_atoms
+      - cost_atoms
+      - result_atoms
+
+    Ignores tags and ActionUnits entirely.
+    """
+    df = pd.read_parquet("MTGCardLibrary.parquet")
+
+    if len(df) == 0:
+        raise ValueError("Card library is empty or not loaded correctly.")
+
+    sample = df.sample(n=min(num_samples, len(df)), random_state=seed)
+
+    for _, row in sample.iterrows():
+        name = str(row.get("name", "") or "")
+        type_line = str(row.get("type_line", "") or "")
+        oracle_text = str(row.get("oracle_text", "") or "")
+        mv = row.get("cmc", None)
+        mana_cost = str(row.get("mana_cost", "") or "")
+        colors = row.get("color_identity", [])
+        if isinstance(colors, list):
+            color_str = "".join(colors) or "Colorless"
+        else:
+            color_str = str(colors) or "Colorless"
+
+        print("=" * 80)
+        print(f"{name} — {type_line}")
+        print(f"MV: {mv} | Cost: {mana_cost} | Colors: {color_str}")
+        print()
+        print("Oracle Text:")
+        print(oracle_text or "(no oracle text)")
+        print()
+
+        abilities = _split_abilities(oracle_text)
+
+        if not abilities:
+            print("No ability clauses (after _split_abilities).")
+            continue
+
+        print("Atoms by clause:\n")
+
+        for idx, clause in enumerate(abilities, start=1):
+            clause = clause.strip()
+            if not clause:
+                continue
+
+            (effect_type,
+             trigger_text,
+             cost_text,
+             result_text,
+             trigger_atoms,
+             cost_atoms,
+             result_atoms) = _atoms_for_clause(clause, card_name=name)
+
+            print(f"  [{idx}] ({effect_type}) {clause}")
+
+            if trigger_text:
+                print(f"       trigger_text: {trigger_text}")
+            if cost_text:
+                print(f"       cost_text:    {cost_text}")
+            if result_text and result_text != clause:
+                print(f"       result_text:  {result_text}")
+
+            # Print atoms
+            if trigger_atoms:
+                print("       trigger_atoms:")
+                for a in trigger_atoms:
+                    print("         -", _fmt_atom(a))
+
+            if cost_atoms:
+                print("       cost_atoms:")
+                for a in cost_atoms:
+                    print("         -", _fmt_atom(a))
+
+            if result_atoms:
+                print("       result_atoms:")
+                for a in result_atoms:
+                    print("         -", _fmt_atom(a))
+
+            if not (trigger_atoms or cost_atoms or result_atoms):
+                print("       (no atoms produced)")
+
+        print()
+
+
 def test_random_cards(num_samples: int = 20, seed: int = 42) -> None:
     """
     Pull a random subset of cards from the library and print their parsed
@@ -1464,11 +1691,5 @@ def test_known_combos() -> None:
 
 
 if __name__ == "__main__":
-    # Random smoke test
-    test_random_cards(num_samples=25, seed=42)
+    test_random_cards_atoms(num_samples=10, seed=42)
 
-    print("\n" + "#" * 80)
-    print("Known combo sanity checks")
-    print("#" * 80 + "\n")
-
-    test_known_combos()

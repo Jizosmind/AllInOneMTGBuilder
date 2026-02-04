@@ -41,4 +41,3 @@ df = pd.json_normalize(bulkData)
 Export Data to Parquet
 '''
 df.to_parquet("MTGCardLibrary.parquet")
-df.to_csv()
